@@ -1,0 +1,89 @@
+alias: "ESP32 Smart Water Meter"
+description: "Smart management of municipal suction pump with dry-run protection"
+mode: restart
+icon: mdi:water-pump
+
+variables:
+  # Tuning Parameters - Adjust these based on your reality
+  priming_time: 10 # minutes to wait before first check
+  min_flow_rate: 5.0 # Liters per minute threshold
+  dry_run_cutoff_delay: 45 # seconds to tolerate low flow during operation (air bubbles)
+
+sequence:
+  # 1. Start the Hunt
+  - service: switch.turn_on
+    target:
+      entity_id: switch.pump_relay
+  - service: notify.mobile_app_admin
+    data:
+      title: "Water Hunter Active"
+      message: "Pump ON. Priming for {{ priming_time }} mins."
+
+  # 2. The Priming Phase (Blind Run)
+  - delay:
+      minutes: "{{ priming_time }}"
+
+  # 3. The Judgment Day
+  - choose:
+      # Scenario A: Water Found!
+      - conditions:
+          - condition: numeric_state
+            entity_id: sensor.flow_rate
+            above: variables.min_flow_rate
+        sequence:
+          - service: notify.mobile_app_admin
+            data:
+              message: "Water Found! Flow is {{ states('sensor.flow_rate') }} LPM. Filling tank."
+          
+          # 4. Sustain Loop (Watchdog)
+          # This loop runs until the pump is turned off externally (e.g. tank full)
+          # OR until the flow drops.
+          - repeat:
+              while:
+                - condition: state
+                  entity_id: switch.pump_relay
+                  state: "on"
+                # Add tank full condition here if you have a float sensor
+                #- condition: state
+                #  entity_id: binary_sensor.tank_full
+                #  state: "off"
+              sequence:
+                # Check for dry run condition
+                - if:
+                    - condition: numeric_state
+                      entity_id: sensor.flow_rate
+                      below: variables.min_flow_rate
+                  then:
+                    # Wait to confirm it's not just a bubble
+                    - delay: 
+                        seconds: "{{ variables.dry_run_cutoff_delay }}"
+                    # Check again
+                    - if:
+                        - condition: numeric_state
+                          entity_id: sensor.flow_rate
+                          below: variables.min_flow_rate
+                      then:
+                        - service: switch.turn_off
+                          target:
+                            entity_id: switch.pump_relay
+                        - service: notify.mobile_app_admin
+                          data:
+                            title: "Hunt Ended"
+                            message: "Supply Ended. Flow dropped to {{ states('sensor.flow_rate') }} LPM."
+                # Pause before next loop iteration to save CPU
+                - delay:
+                    seconds: 5
+
+      # Scenario B: No Water (Dry Run at Start)
+      - conditions:
+          - condition: numeric_state
+            entity_id: sensor.flow_rate
+            below: variables.min_flow_rate
+        sequence:
+          - service: switch.turn_off
+            target:
+              entity_id: switch.pump_relay
+          - service: notify.mobile_app_admin
+            data:
+              title: "Dry Run Detected"
+              message: "No Supply Detected after priming. Pump OFF."
