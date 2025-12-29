@@ -1,0 +1,396 @@
+esphome:
+  name: esp32-watermeter
+  friendly_name: ESP32-WaterMeter
+  comment: Water Flow Sensor with other addons.
+  min_version: 2025.7.4
+
+  on_boot:
+    priority: 600
+    then:
+      - delay: 1s
+      - lambda: |-
+          float t = id(water_collected_total).state;
+          if (isnan(t)) t = 0.0f;
+          id(baseline_litres) = t;
+      - script.execute: boot_animation
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+api:
+  encryption:
+    key: "KEY_HERE"
+
+ota:
+  - platform: esphome
+    password: "PASSWORD_HERE"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Esp32-Watermeter"
+    password: "GrpWKhf8PsCq"
+  on_connect:
+    then:
+      - globals.set: { id: wifi_ok, value: 'true' }
+  on_disconnect:
+    then:
+      - globals.set: { id: wifi_ok, value: 'false' }
+
+captive_portal:
+
+###############################################################################
+#  Globals
+###############################################################################
+globals:
+  - id: baseline_litres
+    type: float
+    restore_value: no
+  - id: calib_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: led_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  - id: wifi_ok
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+  - id: boot_done
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+###############################################################################
+#  Calibration button
+###############################################################################
+button:
+  - platform: template
+    id: calib_btn
+    name: "Start 10 L Calibration"
+    icon: mdi:tune
+    on_press:
+      - globals.set:
+          id: calib_done
+          value: 'true'
+
+###############################################################################
+#  Scripts
+###############################################################################
+script:
+  # --- 5-second rainbow boot animation ---
+  - id: boot_animation
+    mode: restart
+    then:
+      - light.turn_on: water_ring
+
+      # RED
+      - repeat:
+          count: 8
+          then:
+            - light.addressable_set:
+                id: water_ring
+                range_from: !lambda 'return iteration;'
+                range_to:   !lambda 'return iteration;'
+                red: 1
+                green: 0
+                blue: 0
+            - delay: 78ms
+
+      # YELLOW
+      - repeat:
+          count: 8
+          then:
+            - light.addressable_set:
+                id: water_ring
+                range_from: !lambda 'return iteration;'
+                range_to:   !lambda 'return iteration;'
+                red: 1
+                green: 1
+                blue: 0
+            - delay: 78ms
+
+      # GREEN
+      - repeat:
+          count: 8
+          then:
+            - light.addressable_set:
+                id: water_ring
+                range_from: !lambda 'return iteration;'
+                range_to:   !lambda 'return iteration;'
+                red: 0
+                green: 1
+                blue: 0
+            - delay: 78ms
+
+      # BLUE
+      - repeat:
+          count: 8
+          then:
+            - light.addressable_set:
+                id: water_ring
+                range_from: !lambda 'return iteration;'
+                range_to:   !lambda 'return iteration;'
+                red: 0
+                green: 0
+                blue: 1
+            - delay: 78ms
+
+      - light.turn_off: water_ring
+      - delay: 200ms
+      - globals.set:
+          id: boot_done
+          value: 'true'
+
+  # --- 10-litre bucket calibration (unchanged) ---
+  - id: bucket_calibration
+    mode: queued
+    then:
+      - globals.set: { id: calib_done, value: 'false' }
+
+      - pulse_counter.set_total_pulses:
+          id: flow_pulse_rate
+          value: 0
+
+      - wait_until:
+          condition:
+            lambda: 'return id(calib_done);'
+          timeout: 5min
+
+      - lambda: |-
+          uint32_t p = (uint32_t) id(water_collected_pulses).state;
+          float ppl = p / 10.0f;
+          ESP_LOGI("calib", "Measured %.1f pulses/L – update YAML", ppl);
+      - globals.set: { id: calib_done, value: 'false' }
+
+
+
+###############################################################################
+#  Web server
+###############################################################################
+web_server:
+  port: 80
+  version: 3
+  auth:
+    username: "ad"
+    password: "pass"
+  include_internal: true
+  sorting_groups:
+    - id: grp_water
+      name: "Water Meter"
+      sorting_weight: 1
+    - id: grp_health
+      name: "📊 Node Health"
+      sorting_weight: 10
+
+prometheus: {}
+debug:
+  update_interval: 5s
+
+###############################################################################
+#  Sensors
+###############################################################################
+sensor:
+  # --- Raw pulse rate from sensor (pulses/min) ---
+  - platform: pulse_counter
+    id: flow_pulse_rate
+    pin:
+      number: 32
+      mode: INPUT   # strongly consider an external pullup instead of INPUT_PULLUP
+    name: "Flow – Pulses per Min"
+    unit_of_measurement: "pulses/min"
+    accuracy_decimals: 1
+    update_interval: 1s
+    use_pcnt: true
+
+    total:
+      id: water_collected_pulses
+      internal: true
+      unit_of_measurement: "pulses"
+      state_class: total_increasing
+
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 1
+
+  # --- Instantaneous flow in L/s ---
+  - platform: template
+    id: flow_rate_l_s
+    name: "Water Flow Rate – L/s"
+    unit_of_measurement: "L/s"
+    device_class: water
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: 1s
+    lambda: |-
+      // Litres per pulse (update after calibration)
+      const float L_PER_PULSE = 1.0f / 60.0f;   // 60 pulses per litre example
+      float pulses_per_min = id(flow_pulse_rate).state;
+      float pulses_per_sec = pulses_per_min / 60.0f;
+      return pulses_per_sec * L_PER_PULSE;
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 2
+
+  # --- Instantaneous flow in L/min (aggregated from same pulses) ---
+  - platform: template
+    id: flow_rate_l_min
+    name: "Water Flow Rate – L/min"
+    unit_of_measurement: "L/min"
+    device_class: water
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 1s
+    lambda: |-
+      const float L_PER_PULSE = 1.0f / 60.0f;   // same constant
+      float pulses_per_min = id(flow_pulse_rate).state;
+      return pulses_per_min * L_PER_PULSE;
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 3
+
+  # --- Total water in L (all-time) ---
+  - platform: template
+    id: water_collected_total
+    name: "Water Collected – All-time"
+    unit_of_measurement: "L"
+    device_class: volume
+    state_class: total_increasing
+    update_interval: 5s
+    lambda: |-
+      const float L_PER_PULSE = 1.0f / 60.0f;   // keep in sync
+      return id(water_collected_pulses).state * L_PER_PULSE;
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 4
+
+  # --- Session water in L ---
+  - platform: template
+    id: water_collected_session
+    name: "Water Collected – Session"
+    unit_of_measurement: "L"
+    device_class: volume
+    state_class: total_increasing
+    update_interval: 5s
+    lambda: |-
+      return id(water_collected_total).state - id(baseline_litres);
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 5
+
+  - platform: dht
+    pin:
+      number: 19
+      mode:
+        input: true
+        pullup: false
+    model: AUTO_DETECT
+    temperature:
+      name: "Yard Temperature"
+      device_class: temperature
+      state_class: measurement
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 1
+    humidity:
+      name: "Yard Humidity"
+      device_class: humidity
+      state_class: measurement
+      web_server:
+        sorting_group_id: grp_health
+        sorting_weight: 2
+    update_interval: 20s
+###############################################################################
+#  Manual LED enable/disable
+###############################################################################
+switch:
+  - platform: template
+    id: enable_led_switch
+    name: "Enable Flow Light"
+    icon: mdi:led-strip
+    optimistic: true
+    restore_mode: ALWAYS_ON
+    turn_on_action:
+      - globals.set:
+          id: led_enabled
+          value: 'true'
+    turn_off_action:
+      - globals.set:
+          id: led_enabled
+          value: 'false'
+    web_server:
+      sorting_group_id: grp_water
+      sorting_weight: 5
+
+###############################################################################
+#  Flow-activity detector
+###############################################################################
+binary_sensor:
+  - platform: template
+    id: flow_active
+    name: "Flow Active"
+    lambda: |-
+      // TRUE when flow > 2 L/min
+      return id(flow_rate_l_min).state > 2.0f;
+    filters:
+      - delayed_on: 2s     # must stay > 2 L/min for 2 s
+      - delayed_off: 60s   # must stay <= threshold for 60 s
+    on_press:
+      then:
+        - logger.log: "Flow detected – ring will light"
+    on_release:
+      then:
+        - logger.log: "Flow stopped – ring will turn off"
+
+
+###############################################################################
+#  WS2812B ring
+###############################################################################
+light: 
+  - platform: neopixelbus 
+    id: water_ring 
+    type: GRB 
+    variant: ws2812x 
+    pin: 33 
+    num_leds: 8 
+    default_transition_length: 0s 
+    restore_mode: ALWAYS_ON
+
+
+###############################################################################
+#  Flow → colour mapper
+###############################################################################
+interval:
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (!id(boot_done)) return;
+
+          // FIX: use .state
+          if (!id(led_enabled) || !id(wifi_ok) || !id(flow_active).state) {
+            auto off = id(water_ring).turn_off();
+            off.perform();
+            return;
+          }
+
+          const float flow = id(flow_rate_l_min).state;
+          float r = 0, g = 0, b = 0;
+          if (flow < 10)      { r = 1; }
+          else if (flow < 30) { r = 1; g = 1; }
+          else if (flow < 60) { g = 1; }
+          else                { b = 1; }
+
+          const float t  = millis() / 1000.0f;
+          const float br = 0.1f + 0.7f * (sin(t * 6.28318f) * 0.5f + 0.5f);
+
+          auto call = id(water_ring).turn_on();
+          call.set_rgb(r, g, b);
+          call.set_brightness(br);
+          call.perform();
